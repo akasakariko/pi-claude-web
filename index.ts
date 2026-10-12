@@ -392,11 +392,28 @@ class ClaudeAccountPool {
       }
     }
 
-    return null;
+    // 自动兜底：若所有账号都在冷却中，则挑选冷却剩余时间最短的账号尝试，避免全池完全瘫痪
+    let bestCandidate: ClaudeAccount | null = null;
+    let minCooldown = Infinity;
+    for (const a of this.accounts) {
+      if (!excludeIds.has(a.id) && a.rateLimitedUntil < minCooldown) {
+        minCooldown = a.rateLimitedUntil;
+        bestCandidate = a;
+      }
+    }
+    return bestCandidate;
   }
 
   markRateLimited(acc: ClaudeAccount, resetsAt?: number, reason = "使用频次达限") {
-    const cooldownMs = resetsAt ? Math.max(resetsAt * 1000 - Date.now(), 60000) : 3600000; // 默认 1 小时
+    // 默认短冷却 60 秒即可恢复重试；仅当有官方 resets_at 且不超过 5 小时时采用真实解冻时间
+    let cooldownMs = 60000;
+    if (resetsAt && typeof resetsAt === "number") {
+      const targetMs = resetsAt > 1e11 ? resetsAt : resetsAt * 1000;
+      const diff = targetMs - Date.now();
+      if (diff > 0 && diff < 5 * 3600 * 1000) {
+        cooldownMs = diff;
+      }
+    }
     acc.rateLimitedUntil = Date.now() + cooldownMs;
     acc.cooldownReason = reason;
   }
@@ -476,311 +493,323 @@ function streamClaudeWeb(
       timestamp: Date.now(),
     };
 
-    const prompt = formatMessagesToPrompt(transcript.messages);
-    const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
-    // 完全遵循 Pi 标准的 options?.reasoning (例如 --thinking medium 或模型后缀 :medium, :high, :off)
-    const effortMap: Record<string, string> = {
-      minimal: "low",
-      low: "low",
-      medium: "medium",
-      high: "high",
-      xhigh: "xhigh",
-      max: "max",
-    };
+    try {
+      const prompt = formatMessagesToPrompt(transcript.messages);
+      const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
 
-    // 提取 Pi 本地工具 (write, read, edit, bash 等)
-    const rawTools = getCurrentTools(transcript.messages);
-    const tools = rawTools && rawTools.length > 0
-      ? rawTools.map(t => ({
-          name: t.name,
-          description: t.description,
-          input_schema: {
-            type: "object",
-            properties: (t.parameters as any)?.properties || {},
-            required: (t.parameters as any)?.required || [],
-          }
-        }))
-      : undefined;
+      // 提取思考强度
+      const effortMap: Record<string, string> = {
+        minimal: "low",
+        low: "low",
+        medium: "medium",
+        high: "high",
+        xhigh: "xhigh",
+        max: "max",
+      };
 
-    const compBody: Record<string, any> = {
-      prompt,
-      timezone,
-      model: model.id,
-      rendering_mode: "messages",
-    };
+      // 提取 Pi 本地工具 (write, read, edit, bash 等)
+      const rawTools = getCurrentTools(transcript.messages);
+      const tools = rawTools && rawTools.length > 0
+        ? rawTools.map(t => ({
+            name: t.name,
+            description: t.description,
+            input_schema: {
+              type: "object",
+              properties: (t.parameters as any)?.properties || {},
+              required: (t.parameters as any)?.required || [],
+            }
+          }))
+        : undefined;
 
-    if (tools && tools.length > 0) {
-      compBody.tools = tools;
-    }
+      const compBody: Record<string, any> = {
+        prompt,
+        timezone,
+        model: model.id,
+        rendering_mode: "messages",
+      };
 
-    if (options?.reasoning && options.reasoning !== "off") {
-      compBody.thinking_mode = "extended";
-      compBody.effort = effortMap[options.reasoning] || "medium";
-    }
-
-    if (options?.onPayload) {
-      options.onPayload(compBody);
-    }
-
-    const triedAccounts = new Set<string>();
-    let startedStream = false;
-
-    while (true) {
-      const isRetry = triedAccounts.size > 0;
-      const acc = accountPool.getAvailableAccount(triedAccounts, isRetry);
-      if (!acc) {
-        // 池中所有账号都不可用
-        const now = Date.now();
-        const earliest = accountPool.accounts.reduce((min, a) => Math.min(min, a.rateLimitedUntil), Infinity);
-        const waitMinutes = earliest === Infinity ? 60 : Math.max(1, Math.ceil((earliest - now) / 60000));
-        throw new Error(`多号池中所有账号（共 ${accountPool.accounts.length} 个）均已达到使用上限。最早恢复账号预计将在 ${waitMinutes} 分钟后解冻。`);
+      if (tools && tools.length > 0) {
+        compBody.tools = tools;
       }
 
-      triedAccounts.add(acc.id);
-      let convUuid: string | null = null;
-      let orgUuid: string | null = null;
+      if (options?.reasoning && options.reasoning !== "off") {
+        compBody.thinking_mode = "extended";
+        compBody.effort = effortMap[options.reasoning] || "medium";
+      }
 
-      try {
-        orgUuid = await accountPool.ensureOrg(acc);
-        convUuid = crypto.randomUUID();
-        const dispatcher = accountPool.getDispatcher();
+      if (options?.onPayload) {
+        options.onPayload(compBody);
+      }
 
-        // 创建临时会话
-        const createRes = await undiciFetch(`https://claude.ai/api/organizations/${orgUuid}/chat_conversations`, {
-          method: "POST",
-          headers: accountPool.getHeaders(acc),
-          body: JSON.stringify({ uuid: convUuid, name: "" }),
-          dispatcher,
-          signal: options?.signal,
-        });
+      const triedAccounts = new Set<string>();
+      let startedStream = false;
 
-        if (!createRes.ok) {
-          const status = createRes.status;
-          const errText = await createRes.text();
-          if (status === 429 || errText.includes("rate_limit")) {
-            accountPool.markRateLimited(acc, undefined, "创建会话触发 429 限额");
-            continue; // 切换下一个账号重试
+      while (true) {
+        const isRetry = triedAccounts.size > 0;
+        const acc = accountPool.getAvailableAccount(triedAccounts, isRetry);
+
+        if (!acc) {
+          // 安全报错，绝不抛出未捕获异常退出进程！
+          const now = Date.now();
+          const earliest = accountPool.accounts.reduce((min, a) => Math.min(min, a.rateLimitedUntil), Infinity);
+          const waitSeconds = earliest === Infinity ? 60 : Math.max(1, Math.ceil((earliest - now) / 1000));
+          output.stopReason = "error";
+          output.errorMessage = `[Claude Web] 多号池中所有账号（共 ${accountPool.accounts.length} 个）暂时在冷却中，约 ${waitSeconds} 秒后重试。您也可执行 /claude-web reset 立即解除冷却。`;
+          stream.push({ type: "error", error: output });
+          return;
+        }
+
+        triedAccounts.add(acc.id);
+        let convUuid: string | null = null;
+        let orgUuid: string | null = null;
+
+        try {
+          orgUuid = await accountPool.ensureOrg(acc);
+          convUuid = crypto.randomUUID();
+          const dispatcher = accountPool.getDispatcher();
+
+          // 创建临时会话
+          const createRes = await undiciFetch(`https://claude.ai/api/organizations/${orgUuid}/chat_conversations`, {
+            method: "POST",
+            headers: accountPool.getHeaders(acc),
+            body: JSON.stringify({ uuid: convUuid, name: "" }),
+            dispatcher,
+            signal: options?.signal,
+          });
+
+          if (!createRes.ok) {
+            const status = createRes.status;
+            const errText = await createRes.text();
+            if (status === 429 || errText.includes("rate_limit")) {
+              accountPool.markRateLimited(acc, undefined, "创建会话触发 429 限额");
+              continue; // 切换下一个账号重试
+            }
+            throw new Error(`[${acc.displayName}] 创建会话失败 (${status}): ${errText}`);
           }
-          throw new Error(`[${acc.displayName}] 创建会话失败 (${status}): ${errText}`);
-        }
 
-        // 发起流式请求
-        const compRes = await undiciFetch(`https://claude.ai/api/organizations/${orgUuid}/chat_conversations/${convUuid}/completion`, {
-          method: "POST",
-          headers: accountPool.getHeaders(acc, "text/event-stream"),
-          body: JSON.stringify(compBody),
-          dispatcher,
-          signal: options?.signal,
-        });
+          // 发起流式请求
+          const compRes = await undiciFetch(`https://claude.ai/api/organizations/${orgUuid}/chat_conversations/${convUuid}/completion`, {
+            method: "POST",
+            headers: accountPool.getHeaders(acc, "text/event-stream"),
+            body: JSON.stringify(compBody),
+            dispatcher,
+            signal: options?.signal,
+          });
 
-        if (!compRes.ok) {
-          const status = compRes.status;
-          const errText = await compRes.text();
-          if (status === 429 || errText.includes("rate_limit") || errText.includes("resets_at")) {
-            accountPool.markRateLimited(acc, undefined, "推理请求触发 429 限额");
-            continue; // 切换下一个账号重试
+          if (!compRes.ok) {
+            const status = compRes.status;
+            const errText = await compRes.text();
+            if (status === 429 || errText.includes("rate_limit") || errText.includes("resets_at")) {
+              accountPool.markRateLimited(acc, undefined, "推理请求触发 429 限额");
+              continue; // 切换下一个账号重试
+            }
+            throw new Error(`[${acc.displayName}] 推理请求失败 (${status}): ${errText}`);
           }
-          throw new Error(`[${acc.displayName}] 推理请求失败 (${status}): ${errText}`);
-        }
 
-        if (options?.onResponse) {
-          options.onResponse(compRes);
-        }
+          if (options?.onResponse) {
+            options.onResponse(compRes);
+          }
 
-        if (!startedStream) {
-          stream.push({ type: "start", partial: output });
-          startedStream = true;
-        }
+          if (!startedStream) {
+            stream.push({ type: "start", partial: output });
+            startedStream = true;
+          }
 
-        const bodyReader = compRes.body?.getReader();
-        if (!bodyReader) throw new Error("响应数据流为空");
+          const bodyReader = compRes.body?.getReader();
+          if (!bodyReader) throw new Error("响应数据流为空");
 
-        const decoder = new TextDecoder();
-        let buffer = "";
-        type Block = (ThinkingContent | TextContent | (ToolCall & { partialJson: string })) & { index: number };
-        const blocks = output.content as Block[];
-        let receivedTokens = false;
+          const decoder = new TextDecoder();
+          let buffer = "";
+          type Block = (ThinkingContent | TextContent | (ToolCall & { partialJson: string })) & { index: number };
+          const blocks = output.content as Block[];
+          let receivedTokens = false;
 
-        while (true) {
-          const { done, value } = await bodyReader.read();
-          if (done) break;
+          while (true) {
+            const { done, value } = await bodyReader.read();
+            if (done) break;
 
-          buffer += decoder.decode(value, { stream: true });
-          const lines = buffer.split("\n");
-          buffer = lines.pop() || "";
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split("\n");
+            buffer = lines.pop() || "";
 
-          for (const line of lines) {
-            if (!line.startsWith("data:")) continue;
-            const raw = line.slice(5).trim();
-            if (!raw) continue;
+            for (const line of lines) {
+              if (!line.startsWith("data:")) continue;
+              const raw = line.slice(5).trim();
+              if (!raw) continue;
 
-            let event: any;
-            try { event = JSON.parse(raw); } catch { continue; }
+              let event: any;
+              try { event = JSON.parse(raw); } catch { continue; }
 
-            if (options?.onProviderStreamEvent) {
-              await options.onProviderStreamEvent(event, model);
+              if (options?.onProviderStreamEvent) {
+                await options.onProviderStreamEvent(event, model);
+              }
+
+              // 监听配额限制事件
+              if (event.type === "message_limit") {
+                const lim = event.message_limit;
+                if (lim?.type === "exceeded" || lim?.windows?.["5h"]?.status === "exceeded") {
+                  const resetsAt = lim?.windows?.["5h"]?.resets_at;
+                  accountPool.markRateLimited(acc, resetsAt, "5小时使用配额耗尽");
+                }
+              } else if (event.type === "message_start") {
+                if (event.message?.model) output.model = event.message.model;
+              } else if (event.type === "content_block_start") {
+                const blockType = event.content_block?.type;
+                if (blockType === "text") {
+                  output.content.push({ type: "text", text: "", index: event.index } as any);
+                  stream.push({ type: "text_start", contentIndex: output.content.length - 1, partial: output });
+                } else if (blockType === "thinking") {
+                  output.content.push({ type: "thinking", thinking: "", thinkingSignature: "", index: event.index } as any);
+                  stream.push({ type: "thinking_start", contentIndex: output.content.length - 1, partial: output });
+                } else if (blockType === "tool_use") {
+                  output.content.push({
+                    type: "toolCall",
+                    id: event.content_block.id,
+                    name: mapToolName(event.content_block.name, rawTools),
+                    arguments: {},
+                    partialJson: "",
+                    index: event.index,
+                  } as any);
+                  stream.push({ type: "toolcall_start", contentIndex: output.content.length - 1, partial: output });
+                }
+              } else if (event.type === "content_block_delta") {
+                const index = blocks.findIndex(b => b.index === event.index);
+                const block = blocks[index];
+                if (!block) continue;
+                receivedTokens = true;
+
+                if (event.delta?.type === "text_delta" && block.type === "text") {
+                  block.text += event.delta.text;
+                  stream.push({ type: "text_delta", contentIndex: index, delta: event.delta.text, partial: output });
+                } else if (block.type === "thinking") {
+                  let deltaText = "";
+                  if (event.delta?.type === "thinking_delta") {
+                    deltaText = event.delta.thinking || "";
+                  } else if (event.delta?.type === "thinking_summary_delta") {
+                    const s = event.delta.summary;
+                    deltaText = typeof s === "string" ? s : s?.summary || "";
+                    if (deltaText && block.thinking) deltaText = "\n" + deltaText;
+                  }
+                  if (deltaText) {
+                    block.thinking += deltaText;
+                    stream.push({ type: "thinking_delta", contentIndex: index, delta: deltaText, partial: output });
+                  }
+                } else if (event.delta?.type === "input_json_delta" && block.type === "toolCall") {
+                  (block as any).partialJson += event.delta.partial_json;
+                  try {
+                    block.arguments = JSON.parse((block as any).partialJson);
+                  } catch {}
+                  stream.push({ type: "toolcall_delta", contentIndex: index, delta: event.delta.partial_json, partial: output });
+                }
+              } else if (event.type === "content_block_stop") {
+                const index = blocks.findIndex(b => b.index === event.index);
+                const block = blocks[index];
+                if (!block) continue;
+                delete (block as any).index;
+
+                if (block.type === "text") {
+                  stream.push({ type: "text_end", contentIndex: index, content: block.text, partial: output });
+                } else if (block.type === "thinking") {
+                  stream.push({ type: "thinking_end", contentIndex: index, thinking: block.thinking, partial: output });
+                } else if (block.type === "toolCall") {
+                  try {
+                    block.arguments = JSON.parse((block as any).partialJson);
+                  } catch {}
+                  delete (block as any).partialJson;
+                  stream.push({ type: "toolcall_end", contentIndex: index, toolCall: block, partial: output });
+                  output.stopReason = "toolUse";
+                  try { await bodyReader.cancel(); } catch {}
+                  break;
+                }
+              } else if (event.type === "message_delta") {
+                const reason = event.delta?.stop_reason;
+                if (reason === "end_turn" || reason === "stop_sequence") {
+                  output.stopReason = "stop";
+                } else if (reason === "max_tokens") {
+                  output.stopReason = "length";
+                } else if (reason === "tool_use") {
+                  output.stopReason = "toolUse";
+                } else {
+                  output.stopReason = "stop";
+                }
+              } else if (event.type === "message_stop") {
+                if (output.stopReason === "pending") output.stopReason = "stop";
+                let totalChars = 0;
+                for (const b of output.content) {
+                  if (b.type === "text") totalChars += b.text.length;
+                  if (b.type === "thinking") totalChars += b.thinking.length;
+                }
+                output.usage.output = Math.ceil(totalChars / 4);
+                output.usage.input = Math.ceil(prompt.length / 4);
+                output.usage.totalTokens = output.usage.input + output.usage.output;
+                calculateCost(model, output.usage);
+
+                acc.requestsHandled++;
+                stream.push({ type: "done", reason: output.stopReason, message: output });
+              }
             }
 
-            // 监听配额限制事件
-            if (event.type === "message_limit") {
-              const lim = event.message_limit;
-              if (lim?.type === "exceeded" || lim?.windows?.["5h"]?.status === "exceeded") {
-                const resetsAt = lim?.windows?.["5h"]?.resets_at;
-                accountPool.markRateLimited(acc, resetsAt, "5小时使用配额耗尽");
-              }
-            } else if (event.type === "message_start") {
-              if (event.message?.model) output.model = event.message.model;
-            } else if (event.type === "content_block_start") {
-              const blockType = event.content_block?.type;
-              if (blockType === "text") {
-                output.content.push({ type: "text", text: "", index: event.index } as any);
-                stream.push({ type: "text_start", contentIndex: output.content.length - 1, partial: output });
-              } else if (blockType === "thinking") {
-                output.content.push({ type: "thinking", thinking: "", thinkingSignature: "", index: event.index } as any);
-                stream.push({ type: "thinking_start", contentIndex: output.content.length - 1, partial: output });
-              } else if (blockType === "tool_use") {
-                output.content.push({
-                  type: "toolCall",
-                  id: event.content_block.id,
-                  name: mapToolName(event.content_block.name, rawTools),
-                  arguments: {},
-                  partialJson: "",
-                  index: event.index,
-                } as any);
-                stream.push({ type: "toolcall_start", contentIndex: output.content.length - 1, partial: output });
-              }
-            } else if (event.type === "content_block_delta") {
-              const index = blocks.findIndex(b => b.index === event.index);
-              const block = blocks[index];
-              if (!block) continue;
-              receivedTokens = true;
-
-              if (event.delta?.type === "text_delta" && block.type === "text") {
-                block.text += event.delta.text;
-                stream.push({ type: "text_delta", contentIndex: index, delta: event.delta.text, partial: output });
-              } else if (block.type === "thinking") {
-                let deltaText = "";
-                if (event.delta?.type === "thinking_delta") {
-                  deltaText = event.delta.thinking || "";
-                } else if (event.delta?.type === "thinking_summary_delta") {
-                  const s = event.delta.summary;
-                  deltaText = typeof s === "string" ? s : s?.summary || "";
-                  if (deltaText && block.thinking) deltaText = "\n" + deltaText;
-                }
-                if (deltaText) {
-                  block.thinking += deltaText;
-                  stream.push({ type: "thinking_delta", contentIndex: index, delta: deltaText, partial: output });
-                }
-              } else if (event.delta?.type === "input_json_delta" && block.type === "toolCall") {
-                (block as any).partialJson += event.delta.partial_json;
-                try {
-                  block.arguments = JSON.parse((block as any).partialJson);
-                } catch {}
-                stream.push({ type: "toolcall_delta", contentIndex: index, delta: event.delta.partial_json, partial: output });
-              }
-            } else if (event.type === "content_block_stop") {
-              const index = blocks.findIndex(b => b.index === event.index);
-              const block = blocks[index];
-              if (!block) continue;
-              delete (block as any).index;
-
-              if (block.type === "text") {
-                stream.push({ type: "text_end", contentIndex: index, content: block.text, partial: output });
-              } else if (block.type === "thinking") {
-                stream.push({ type: "thinking_end", contentIndex: index, thinking: block.thinking, partial: output });
-              } else if (block.type === "toolCall") {
-                try {
-                  block.arguments = JSON.parse((block as any).partialJson);
-                } catch {}
-                delete (block as any).partialJson;
-                stream.push({ type: "toolcall_end", contentIndex: index, toolCall: block, partial: output });
-                output.stopReason = "toolUse";
-                try { await bodyReader.cancel(); } catch {}
-                break;
-              }
-            } else if (event.type === "message_delta") {
-              const reason = event.delta?.stop_reason;
-              if (reason === "end_turn" || reason === "stop_sequence") {
-                output.stopReason = "stop";
-              } else if (reason === "max_tokens") {
-                output.stopReason = "length";
-              } else if (reason === "tool_use") {
-                output.stopReason = "toolUse";
-              } else {
-                output.stopReason = "stop";
-              }
-            } else if (event.type === "message_stop") {
-              if (output.stopReason === "pending") output.stopReason = "stop";
-              let totalChars = 0;
-              for (const b of output.content) {
-                if (b.type === "text") totalChars += b.text.length;
-                if (b.type === "thinking") totalChars += b.thinking.length;
-              }
-              output.usage.output = Math.ceil(totalChars / 4);
-              output.usage.input = Math.ceil(prompt.length / 4);
-              output.usage.totalTokens = output.usage.input + output.usage.output;
-              calculateCost(model, output.usage);
-
-              acc.requestsHandled++;
-              stream.push({ type: "done", reason: output.stopReason, message: output });
+            if (output.stopReason === "toolUse") {
+              break; // 立即跳出 while 读取循环！
             }
           }
 
           if (output.stopReason === "toolUse") {
-            break; // 关键：立即跳出 while 读取循环！
+            acc.requestsHandled++;
+            let totalChars = 0;
+            for (const b of output.content) {
+              if (b.type === "text") totalChars += b.text.length;
+              if (b.type === "thinking") totalChars += b.thinking.length;
+            }
+            output.usage.output = Math.ceil(totalChars / 4) + 20;
+            output.usage.input = Math.ceil(prompt.length / 4);
+            output.usage.totalTokens = output.usage.input + output.usage.output;
+            calculateCost(model, output.usage);
+
+            stream.push({ type: "done", reason: "toolUse", message: output });
+          } else if (output.stopReason === "pending") {
+            output.stopReason = "stop";
+            acc.requestsHandled++;
+            stream.push({ type: "done", reason: output.stopReason, message: output });
           }
-        }
 
-        if (output.stopReason === "toolUse") {
-          acc.requestsHandled++;
-          let totalChars = 0;
-          for (const b of output.content) {
-            if (b.type === "text") totalChars += b.text.length;
-            if (b.type === "thinking") totalChars += b.thinking.length;
-          }
-          output.usage.output = Math.ceil(totalChars / 4) + 20;
-          output.usage.input = Math.ceil(prompt.length / 4);
-          output.usage.totalTokens = output.usage.input + output.usage.output;
-          calculateCost(model, output.usage);
-
-          stream.push({ type: "done", reason: "toolUse", message: output });
-        } else if (output.stopReason === "pending") {
-          output.stopReason = "stop";
-          acc.requestsHandled++;
-          stream.push({ type: "done", reason: output.stopReason, message: output });
-        }
-
-        // 当前账号成功完成请求，结束循环
-        break;
-      } catch (err: any) {
-        if (options?.signal?.aborted) {
-          output.stopReason = "aborted";
-          stream.push({ type: "done", reason: "aborted", message: output });
+          // 成功完成本次请求，退出重试循环
           break;
-        }
+        } catch (err: any) {
+          if (options?.signal?.aborted) {
+            output.stopReason = "aborted";
+            stream.push({ type: "done", reason: "aborted", message: output });
+            break;
+          }
 
-        const msg = err?.message || String(err);
-        // 如果在输出文字之前报错且属于限额或网络异常，尝试换下一个账号
-        if (!startedStream && (msg.includes("429") || msg.includes("rate_limit") || msg.includes("overage"))) {
-          accountPool.markRateLimited(acc, undefined, "调用异常触发限额");
-          continue;
-        }
+          const msg = err?.message || String(err);
+          // 若在数据流开始前报错且属于限额或网络异常，记录短冷却并换下一个账号
+          if (!startedStream && (msg.includes("429") || msg.includes("rate_limit") || msg.includes("overage"))) {
+            accountPool.markRateLimited(acc, undefined, "调用异常触发限额");
+            continue;
+          }
 
-        output.stopReason = "error";
-        output.errorMessage = msg;
-        stream.push({ type: "error", error: output });
-        break;
-      } finally {
-        // 清理当前会话
-        if (convUuid && orgUuid) {
-          const dispatcher = accountPool.getDispatcher();
-          undiciFetch(`https://claude.ai/api/organizations/${orgUuid}/chat_conversations/${convUuid}`, {
-            method: "DELETE",
-            headers: accountPool.getHeaders(acc),
-            dispatcher,
-          }).catch(() => {});
+          output.stopReason = "error";
+          output.errorMessage = msg;
+          stream.push({ type: "error", error: output });
+          break;
+        } finally {
+          // 清理当前会话
+          if (convUuid && orgUuid) {
+            const dispatcher = accountPool.getDispatcher();
+            undiciFetch(`https://claude.ai/api/organizations/${orgUuid}/chat_conversations/${convUuid}`, {
+              method: "DELETE",
+              headers: accountPool.getHeaders(acc),
+              dispatcher,
+            }).catch(() => {});
+          }
         }
       }
+    } catch (topErr: any) {
+      // 顶级异常兜底，严禁触发 uncaughtException 导致 Pi 退出！
+      output.stopReason = "error";
+      output.errorMessage = topErr?.message || String(topErr);
+      stream.push({ type: "error", error: output });
     }
   })();
 
@@ -903,7 +932,7 @@ export default function (pi: ExtensionAPI) {
 
       lines.push("");
       lines.push(`当前调度策略: ${accountPool.strategy === "round-robin" ? "🔄 轮询均摊 (Round-Robin)" : "🛡️ 主备容灾 (Failover)"}`);
-            lines.push("可用指令: /claude-web mode <round-robin|failover>, /claude-web switch <序号>, /claude-web reload");
+            lines.push("可用指令: /claude-web mode <round-robin|failover>, /claude-web switch <序号>, /claude-web reset, /claude-web reload");
       ctx.ui.notify(lines.join("\n"), "info");
     },
   });
