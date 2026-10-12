@@ -1,3 +1,14 @@
+function extractResetsAt(text: string): number | undefined {
+  try {
+    const match = text.match(/"resets_?at":\s*(\d+)/i);
+    if (match) {
+      const val = parseInt(match[1], 10);
+      return val > 1e11 ? Math.floor(val / 1000) : val;
+    }
+  } catch {}
+  return undefined;
+}
+
 function mapToolName(name: string, availableTools?: { name: string }[]): string {
   if (availableTools?.some(t => t.name === name)) return name;
   const lower = name.toLowerCase();
@@ -551,10 +562,21 @@ function streamClaudeWeb(
         if (!acc) {
           // 安全报错，绝不抛出未捕获异常退出进程！
           const now = Date.now();
-          const earliest = accountPool.accounts.reduce((min, a) => Math.min(min, a.rateLimitedUntil), Infinity);
-          const waitSeconds = earliest === Infinity ? 60 : Math.max(1, Math.ceil((earliest - now) / 1000));
+          const accountDetails = accountPool.accounts.map(a => {
+            const diffMin = Math.max(1, Math.ceil((a.rateLimitedUntil - now) / 60000));
+            const timeStr = diffMin > 60 ? `${(diffMin / 60).toFixed(1)} 小时` : `${diffMin} 分钟`;
+            return `  • ${a.displayName}: 约 ${timeStr} 后解冻 (${a.cooldownReason || "限额"})`;
+          }).join("\n");
+
           output.stopReason = "error";
-          output.errorMessage = `[Claude Web] 多号池中所有账号（共 ${accountPool.accounts.length} 个）暂时在冷却中，约 ${waitSeconds} 秒后重试。您也可执行 /claude-web reset 立即解除冷却。`;
+          output.errorMessage = [
+            `⚠️ [Claude Web] 多号池中所有账号（共 ${accountPool.accounts.length} 个）均已达到 Anthropic 免费使用上限：`,
+            accountDetails,
+            "",
+            "💡 提示：您可按 Ctrl+P 或 /model 临时切换其他模型继续工作；也可在 Firefox 新建容器标签页登录新账号扩充号池。",
+            "若需强行重置状态，可执行 /claude-web reset。"
+          ].join("\n");
+
           stream.push({ type: "error", error: output });
           return;
         }
@@ -581,7 +603,7 @@ function streamClaudeWeb(
             const status = createRes.status;
             const errText = await createRes.text();
             if (status === 429 || errText.includes("rate_limit")) {
-              accountPool.markRateLimited(acc, undefined, "创建会话触发 429 限额");
+              accountPool.markRateLimited(acc, extractResetsAt(errText), "创建会话触发 429 限额");
               continue; // 切换下一个账号重试
             }
             throw new Error(`[${acc.displayName}] 创建会话失败 (${status}): ${errText}`);
@@ -600,7 +622,7 @@ function streamClaudeWeb(
             const status = compRes.status;
             const errText = await compRes.text();
             if (status === 429 || errText.includes("rate_limit") || errText.includes("resets_at")) {
-              accountPool.markRateLimited(acc, undefined, "推理请求触发 429 限额");
+              accountPool.markRateLimited(acc, extractResetsAt(errText), "5小时使用配额耗尽");
               continue; // 切换下一个账号重试
             }
             throw new Error(`[${acc.displayName}] 推理请求失败 (${status}): ${errText}`);
