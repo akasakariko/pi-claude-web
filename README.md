@@ -37,7 +37,7 @@ Simply clone or copy `index.ts` into your Pi extensions directory:
 
 ```bash
 mkdir -p ~/.pi/agent/extensions
-curl -fsSL https://raw.githubusercontent.com/KayanoLiam/pi-claude-web/main/index.ts -o ~/.pi/agent/extensions/claude-web.ts
+curl -fsSL https://raw.githubusercontent.com/akasakariko/pi-claude-web/main/index.ts -o ~/.pi/agent/extensions/claude-web.ts
 ```
 
 Pi automatically loads any TypeScript files located in `~/.pi/agent/extensions/` on startup.
@@ -47,7 +47,7 @@ Pi automatically loads any TypeScript files located in `~/.pi/agent/extensions/`
 Install via the Pi CLI:
 
 ```bash
-pi install git:github.com/KayanoLiam/pi-claude-web
+pi install git:github.com/akasakariko/pi-claude-web
 ```
 
 ---
