@@ -1,0 +1,26 @@
+{
+  "name": "pi-claude-web",
+  "version": "1.0.0",
+  "description": "Pi coding agent provider extension for Claude Web free models (Sonnet 5.5 & Haiku 5.5) with multi-browser account pooling and full local tool execution.",
+  "main": "index.ts",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "claude",
+    "anthropic",
+    "claude-web",
+    "ai-agent",
+    "coding-agent"
+  ],
+  "author": "KayanoLiam",
+  "license": "MIT",
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  }
+}
