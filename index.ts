@@ -658,9 +658,19 @@ function streamClaudeWeb(
               if (event.delta?.type === "text_delta" && block.type === "text") {
                 block.text += event.delta.text;
                 stream.push({ type: "text_delta", contentIndex: index, delta: event.delta.text, partial: output });
-              } else if (event.delta?.type === "thinking_delta" && block.type === "thinking") {
-                block.thinking += event.delta.thinking;
-                stream.push({ type: "thinking_delta", contentIndex: index, delta: event.delta.thinking, partial: output });
+              } else if (block.type === "thinking") {
+                let deltaText = "";
+                if (event.delta?.type === "thinking_delta") {
+                  deltaText = event.delta.thinking || "";
+                } else if (event.delta?.type === "thinking_summary_delta") {
+                  const s = event.delta.summary;
+                  deltaText = typeof s === "string" ? s : s?.summary || "";
+                  if (deltaText && block.thinking) deltaText = "\n" + deltaText;
+                }
+                if (deltaText) {
+                  block.thinking += deltaText;
+                  stream.push({ type: "thinking_delta", contentIndex: index, delta: deltaText, partial: output });
+                }
               } else if (event.delta?.type === "input_json_delta" && block.type === "toolCall") {
                 (block as any).partialJson += event.delta.partial_json;
                 try {
