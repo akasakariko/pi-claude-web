@@ -71,26 +71,21 @@ pi --model claude-web/claude-sonnet-5-5 -p "Analyze this repository and write a 
 
 ### Thinking / Reasoning Levels
 
-Uses standard Pi thinking level controls without needing custom subcommands:
+All 5 native Claude Web reasoning tiers (`low`, `medium`, `high`, `xhigh`, `max`) are supported 1:1 using Pi's standard controls:
 
-```bash
-# High reasoning effort
-pi --model claude-web/claude-sonnet-5-5:high
+| Pi Level | Claude Web Effort | Description | Example Command |
+| :--- | :--- | :--- | :--- |
+| **`off`** | `off` | Standard fast response without thinking | `pi --model claude-web/claude-sonnet-5-5:off` |
+| **`low`** / `minimal` | `low` | Light chain-of-thought for simple tasks | `pi --model claude-web/claude-sonnet-5-5:low` |
+| **`medium`** | `medium` | Balanced reasoning effort (Default on web) | `pi --model claude-web/claude-sonnet-5-5:medium` |
+| **`high`** | `high` | Deep thinking for difficult problems & coding | `pi --model claude-web/claude-sonnet-5-5:high` |
+| **`xhigh`** | `xhigh` | Extra-high reasoning effort for hard math/logic | `pi --model claude-web/claude-sonnet-5-5:xhigh` |
+| **`max`** | `max` | Maximum available thinking budget | `pi --model claude-web/claude-sonnet-5-5:max` |
 
-# Medium reasoning effort
-pi --model claude-web/claude-sonnet-5-5:medium
-
-# Disable thinking (standard response)
-pi --model claude-web/claude-sonnet-5-5:off
-
-# Or use Pi's standard CLI flag
-pi --model claude-web/claude-sonnet-5-5 --thinking medium
-```
-
-Inside an interactive Pi session, switch models and thinking levels anytime:
+Inside an interactive Pi session, switch anytime:
 ```text
-/model claude-web/claude-sonnet-5-5:medium
-/thinking high
+/model claude-web/claude-sonnet-5-5:xhigh
+/thinking max
 ```
 
 ---

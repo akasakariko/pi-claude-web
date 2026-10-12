@@ -484,8 +484,8 @@ function streamClaudeWeb(
       low: "low",
       medium: "medium",
       high: "high",
-      xhigh: "high",
-      max: "high",
+      xhigh: "xhigh",
+      max: "max",
     };
 
     // 提取 Pi 本地工具 (write, read, edit, bash 等)
@@ -804,8 +804,8 @@ export default function (pi: ExtensionAPI) {
           low: "low",
           medium: "medium",
           high: "high",
-          xhigh: "high",
-          max: "high",
+          xhigh: "xhigh",
+          max: "max",
         },
         input: ["text"],
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
@@ -822,8 +822,8 @@ export default function (pi: ExtensionAPI) {
           low: "low",
           medium: "medium",
           high: "high",
-          xhigh: "high",
-          max: "high",
+          xhigh: "xhigh",
+          max: "max",
         },
         input: ["text"],
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
